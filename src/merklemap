@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+
+# @describe Search Merklemap certificate transparency database for SSL/TLS certificates
+# @arg query "Search query (domain, subdomain, or certificate subject)" [string]
+# @flag -h --help "Show help information"
+# @option -p --page "Page number for pagination" [int] @default "0"
+
+# @flag -j --json "Output raw JSON response"
+# @flag -q --quiet "Suppress colored output and progress indicators"
+# @flag --no-header "Don't display header information"
+# @flag --csv "Output results in CSV format"
+# @flag --sort-date "Sort results by first_seen date (newest first)"
+# @meta require-tools curl,jq
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+set -euo pipefail
+
+setup_colors() {
+  if [ "${argc_quiet:-0}" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red="" white=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+  fi
+}
+setup_colors
+
+# Color formatting functions
+bold_text() {
+  printf "${bold}%s${reset}" "$1"
+}
+
+red() {
+  printf "${red}%s${reset}" "$1"
+}
+
+green() {
+  printf "${green}%s${reset}" "$1"
+}
+
+yellow() {
+  printf "${yellow}%s${reset}" "$1"
+}
+
+blue() {
+  printf "${blue}%s${reset}" "$1"
+}
+
+cyan() {
+  printf "${cyan}%s${reset}" "$1"
+}
+
+magenta() {
+  printf "${magenta}%s${reset}" "$1"
+}
+
+make_request() {
+  local query="$1"
+  local page="$2"
+
+
+  local url="https://api.merklemap.com/v1-webui/search-noauth"
+  local response=$(curl -s --fail --max-time 30 "$url" \
+    -G \
+    --data-urlencode "query=$query" \
+    --data-urlencode "page=$page" \
+    --data-urlencode "size=1000")
+
+  if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+    printf "$(red "Error"): Invalid JSON response from API\n" >&2
+    printf "Response: %s\n" "$response" >&2
+    exit 1
+  fi
+
+  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+    error_msg=$(echo "$response" | jq -r '.error // .message // "Unknown error"')
+    printf "$(red "API Error"): %s\n" "$error_msg" >&2
+    exit 1
+  fi
+
+  echo "$response"
+}
+
+show_help() {
+  echo "$(bold_text "Merklemap Certificate Transparency Search")"
+  echo ""
+  echo "$(bold_text "Description"):"
+  echo "  Search certificate transparency logs via Merklemap API for SSL/TLS certificates"
+  echo ""
+  echo "$(bold_text "Usage"):"
+  echo "  $(green "$(basename "$0") <query>")"
+  echo "  $(green "$(basename "$0") --help")"
+  echo ""
+  echo "$(bold_text "Examples"):"
+  echo "  $(green "$(basename "$0") example.com")"
+  echo "  $(green "$(basename "$0") \"api.*.example.com\"")"
+  echo "  $(green "$(basename "$0") revelo")"
+  echo "  $(green "$(basename "$0") \"*.github.com\" --page 2")"
+  echo ""
+  echo "$(bold_text "Options"):"
+  echo "  $(yellow "-p, --page")        Page number for pagination (default: 0)"
+
+  echo "  $(yellow "-j, --json")        Output raw JSON response"
+  echo "  $(yellow "-q, --quiet")       Suppress colored output"
+  echo "  $(yellow "--no-header")       Don't display header information"
+  echo "  $(yellow "--csv")             Output results in CSV format"
+  echo "  $(yellow "--sort-date")       Sort results by first_seen date (newest first)"
+  echo ""
+  echo "$(bold_text "Notes"):"
+  echo "  • Search supports wildcard patterns and domain/subdomain queries"
+  echo "  • Results include certificate subject names, hostnames, and first seen dates"
+  echo "  • API endpoint: https://api.merklemap.com/v1-webui/search-noauth"
+  echo "  • No authentication required for basic searches"
+}
+
+format_search_results() {
+  local response="$1"
+  local total=$(echo "$response" | jq -r '.count // 0')
+  local results_count=$(echo "$response" | jq '.results | length')
+
+  if [ "${argc_no_header:-0}" != "1" ] && [ "${argc_quiet:-0}" != "1" ]; then
+    printf "$(bold_text "$(green "=== Merklemap Certificate Search Results ===")")\n"
+    printf "$(yellow "Total Found"): %s certificates\n" "$total"
+    printf "$(yellow "Showing"): %s results (page %s)\n" "$results_count" "${argc_page:-0}"
+    printf "$(yellow "Query"): %s\n" "${argc_query:-}"
+    printf "\n"
+  fi
+
+  if [ "$total" -eq 0 ]; then
+    printf "$(yellow "No certificates found for query: ${argc_query:-}")\n"
+    return 0
+  fi
+
+  local tmp_file=$(mktemp)
+
+  if [ "${argc_sort_date:-0}" = "1" ]; then
+    echo "$response" | jq -c '.results[] | . + {sort_date: (.first_seen | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)}' | \
+      sort -t'"' -k8 -nr | sed 's/,"sort_date":[0-9]*}/}/' > "$tmp_file"
+  else
+    echo "$response" | jq -c '.results[]' > "$tmp_file"
+  fi
+
+  while read -r cert; do
+    hostname=$(echo "$cert" | jq -r '.hostname // "N/A"')
+    subject_cn=$(echo "$cert" | jq -r '.subject_common_name // "N/A"')
+    first_seen=$(echo "$cert" | jq -r '.first_seen // "N/A"')
+
+    # Parse and format the date
+    if [ "$first_seen" != "N/A" ] && [ "$first_seen" != "null" ]; then
+      formatted_date=$(date -d "$first_seen" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "$first_seen")
+    else
+      formatted_date="N/A"
+    fi
+
+    printf "$(yellow "Hostname"): $(blue "%s")\n" "$hostname"
+
+    if [ "$subject_cn" != "$hostname" ] && [ "$subject_cn" != "N/A" ]; then
+      printf "$(yellow "Subject CN"): $(cyan "%s")\n" "$subject_cn"
+    fi
+
+    printf "$(yellow "First Seen"): %s\n" "$formatted_date"
+
+    # Check if it's a wildcard certificate
+    if [[ "$hostname" == \*.* ]] || [[ "$subject_cn" == \*.* ]]; then
+      printf "$(yellow "Type"): $(magenta "Wildcard Certificate")\n"
+    fi
+
+    printf "\n"
+  done < "$tmp_file"
+
+  rm -f "$tmp_file"
+
+  # Show pagination info
+  if [ "${argc_quiet:-0}" != "1" ] && [ "$total" -gt 0 ]; then
+    local size=1000
+    local page="${argc_page:-0}"
+    local current_start=$((page * size + 1))
+    local current_end=$(((page + 1) * size))
+
+    if [ "$current_end" -gt "$total" ]; then
+      current_end="$total"
+    fi
+
+    printf "$(bold_text "$(yellow "Showing results $current_start-$current_end of $total")")\n"
+
+    if [ "$current_end" -lt "$total" ]; then
+      next_page=$((page + 1))
+      printf "$(cyan "To see more results, use: --page $next_page")\n"
+    fi
+  fi
+}
+
+generate_csv() {
+  local response="$1"
+  printf "hostname,subject_common_name,first_seen\n"
+
+  if [ "${argc_sort_date:-0}" = "1" ]; then
+    echo "$response" | jq -r '.results[] | . + {sort_date: (.first_seen | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime)}' | \
+      sort -t'"' -k8 -nr | jq -r '[.hostname, .subject_common_name, .first_seen] | @csv'
+  else
+    echo "$response" | jq -r '.results[] | [.hostname, .subject_common_name, .first_seen] | @csv'
+  fi
+}
+
+do_search() {
+  local query="${argc_query:-}"
+  if [ -z "$query" ]; then
+    printf "$(red "Error"): Search query is required\n" >&2
+    show_help
+    exit 1
+  fi
+
+
+  local page="${argc_page:-0}"
+
+
+  if [ "${argc_quiet:-0}" != "1" ]; then
+    printf "$(bold_text "$(cyan "Searching Merklemap certificate database...")")\n"
+    printf "$(yellow "Query"): %s\n" "$query"
+    printf "$(yellow "Page"): %s\n" "$page"
+    printf "\n"
+  fi
+
+  local response=$(make_request "$query" "$page")
+
+  if [ "${argc_json:-0}" = "1" ]; then
+    echo "$response" | jq
+    exit 0
+  fi
+
+  if [ "${argc_csv:-0}" = "1" ]; then
+    generate_csv "$response"
+    exit 0
+  fi
+
+  format_search_results "$response"
+}
+
+if [ "${argc_help:-0}" = "1" ]; then
+  show_help
+  exit 0
+fi
+
+do_search
