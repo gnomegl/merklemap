@@ -4,6 +4,7 @@
 # @arg query "Search query (domain, subdomain, or certificate subject)" [string]
 # @flag -h --help "Show help information"
 # @option -p --page "Page number for pagination" [int] @default "0"
+# @option -t --type "Search type (wildcard or distance)" [string] @default "wildcard"
 
 # @flag -j --json "Output raw JSON response"
 # @flag -q --quiet "Suppress colored output and progress indicators"
@@ -39,7 +40,7 @@ _argc_usage() {
     cat <<-'EOF'
 Search Merklemap certificate transparency database for SSL/TLS certificates
 
-USAGE: merkelmap [OPTIONS] [QUERY]
+USAGE: merklemap [OPTIONS] [QUERY]
 
 ARGS:
   [QUERY]  "Search query (domain, subdomain, or certificate subject)" [string]
@@ -47,6 +48,7 @@ ARGS:
 OPTIONS:
   -h, --help         "Show help information"
   -p, --page <PAGE>  "Page number for pagination" [int] @default "0"
+  -t, --type <TYPE>  "Search type (wildcard or distance)" [string] @default "wildcard"
   -j, --json         "Output raw JSON response"
   -q, --quiet        "Suppress colored output and progress indicators"
       --no-header    "Don't display header information"
@@ -58,7 +60,7 @@ EOF
 }
 
 _argc_version() {
-    echo merkelmap 0.0.0
+    echo merklemap 0.0.0
     exit
 }
 
@@ -88,6 +90,15 @@ _argc_parse() {
                 argc_page="${_argc_take_args_values[0]:-}"
             else
                 _argc_die "error: the argument \`--page\` cannot be used multiple times"
+            fi
+            ;;
+        --type | -t)
+            _argc_take_args "--type <TYPE>" 1 1 "-" ""
+            _argc_index=$((_argc_index + _argc_take_args_len + 1))
+            if [[ -z "${argc_type:-}" ]]; then
+                argc_type="${_argc_take_args_values[0]:-}"
+            else
+                _argc_die "error: the argument \`--type\` cannot be used multiple times"
             fi
             ;;
         --json | -j)
@@ -307,10 +318,11 @@ set -euo pipefail
 
 setup_colors() {
   if [ "${argc_quiet:-0}" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
-    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red="" white=""
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red="" white="" bg_yellow="" black=""
   else
     bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
     yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+    bg_yellow=$(tput setab 3) black=$(tput setaf 0)
   fi
 }
 setup_colors
@@ -344,17 +356,63 @@ magenta() {
   printf "${magenta}%s${reset}" "$1"
 }
 
+highlight_match() {
+  local text="$1"
+  local query="$2"
+  local color="$3"
+  
+  # Skip highlighting for distance searches
+  if [ -z "$query" ] || [ "${argc_quiet:-0}" = "1" ] || [ "${argc_type:-}" = "distance" ]; then
+    printf "%s" "$text"
+    return
+  fi
+  
+  # Convert wildcard pattern to regex
+  # First escape special regex characters except * and .
+  local regex_pattern=$(echo "$query" | sed 's/[][^$()+?{|]/\\&/g')
+  # Then convert * to .* for wildcard matching
+  regex_pattern=$(echo "$regex_pattern" | sed 's/\*/[^.]*/g')
+  
+  # Apply highlighting to matching portions only
+  local result="$text"
+  local highlighted=""
+  local remaining="$text"
+  
+  # Use perl for better regex support if available, otherwise fallback to sed
+  if command -v perl >/dev/null 2>&1; then
+    # Perl gives us better control over highlighting - black text on yellow background
+    highlighted=$(echo "$text" | perl -pe "s/($regex_pattern)/${reset}${bg_yellow}${black}${bold}\$1${reset}${color}/gi")
+  else
+    # Fallback to sed - black text on yellow background
+    highlighted=$(echo "$text" | sed -E "s/($regex_pattern)/${reset}${bg_yellow}${black}${bold}&${reset}${color}/gi")
+  fi
+  
+  printf "%s" "$highlighted"
+}
+
 make_request() {
   local query="$1"
   local page="$2"
 
 
   local url="https://api.merklemap.com/v1-webui/search-noauth"
-  local response=$(curl -s --fail --max-time 30 "$url" \
-    -G \
-    --data-urlencode "query=$query" \
-    --data-urlencode "page=$page" \
-    --data-urlencode "size=1000")
+  
+  # Check if we're doing a distance search
+  if [ "${argc_type:-}" = "distance" ]; then
+    local response=$(curl -s --fail --max-time 30 "$url" \
+      -G \
+      --data-urlencode "query=$query" \
+      --data-urlencode "page=$page" \
+      --data-urlencode "size=1000" \
+      --data-urlencode "type=distance" \
+      --data-urlencode "_rsc=1hi0z")
+  else
+    local response=$(curl -s --fail --max-time 30 "$url" \
+      -G \
+      --data-urlencode "query=$query" \
+      --data-urlencode "page=$page" \
+      --data-urlencode "size=1000")
+  fi
 
   if ! echo "$response" | jq -e . >/dev/null 2>&1; then
     printf "$(red "Error"): Invalid JSON response from API\n" >&2
@@ -378,16 +436,17 @@ show_help() {
   echo "  Search certificate transparency logs via Merklemap API for SSL/TLS certificates"
   echo ""
   echo "$(bold_text "Usage"):"
-  echo "  $(green "$(basename "$0") <query>")"
+  echo "  $(green "$(basename "$0") <query> [options]")"
   echo "  $(green "$(basename "$0") --help")"
   echo ""
   echo "$(bold_text "Examples"):"
   echo "  $(green "$(basename "$0") example.com")"
   echo "  $(green "$(basename "$0") \"api.*.example.com\"")"
-  echo "  $(green "$(basename "$0") revelo")"
+  echo "  $(green "$(basename "$0") revelo --type distance")"
   echo "  $(green "$(basename "$0") \"*.github.com\" --page 2")"
   echo ""
   echo "$(bold_text "Options"):"
+  echo "  $(yellow "-t, --type")        Search type: wildcard (default) or distance"
   echo "  $(yellow "-p, --page")        Page number for pagination (default: 0)"
 
   echo "  $(yellow "-j, --json")        Output raw JSON response"
@@ -397,7 +456,8 @@ show_help() {
   echo "  $(yellow "--sort-date")       Sort results by first_seen date (newest first)"
   echo ""
   echo "$(bold_text "Notes"):"
-  echo "  • Search supports wildcard patterns and domain/subdomain queries"
+  echo "  • Wildcard search (default) supports wildcard patterns and highlights matches"
+  echo "  • Distance search performs fuzzy matching without highlighting"
   echo "  • Results include certificate subject names, hostnames, and first seen dates"
   echo "  • API endpoint: https://api.merklemap.com/v1-webui/search-noauth"
   echo "  • No authentication required for basic searches"
@@ -435,17 +495,18 @@ format_search_results() {
     subject_cn=$(echo "$cert" | jq -r '.subject_common_name // "N/A"')
     first_seen=$(echo "$cert" | jq -r '.first_seen // "N/A"')
 
-    # Parse and format the date
     if [ "$first_seen" != "N/A" ] && [ "$first_seen" != "null" ]; then
       formatted_date=$(date -d "$first_seen" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "$first_seen")
     else
       formatted_date="N/A"
     fi
 
-    printf "$(yellow "Hostname"): $(blue "%s")\n" "$hostname"
+    highlighted_hostname=$(highlight_match "$hostname" "${argc_query:-}" "$blue")
+    printf "$(yellow "Hostname"): ${blue}%s${reset}\n" "$highlighted_hostname"
 
     if [ "$subject_cn" != "$hostname" ] && [ "$subject_cn" != "N/A" ]; then
-      printf "$(yellow "Subject CN"): $(cyan "%s")\n" "$subject_cn"
+      highlighted_subject_cn=$(highlight_match "$subject_cn" "${argc_query:-}" "$cyan")
+      printf "$(yellow "Subject CN"): ${cyan}%s${reset}\n" "$highlighted_subject_cn"
     fi
 
     printf "$(yellow "First Seen"): %s\n" "$formatted_date"
@@ -494,19 +555,13 @@ generate_csv() {
 
 do_search() {
   local query="${argc_query:-}"
-  if [ -z "$query" ]; then
-    printf "$(red "Error"): Search query is required\n" >&2
-    show_help
-    exit 1
-  fi
-
-
   local page="${argc_page:-0}"
 
 
   if [ "${argc_quiet:-0}" != "1" ]; then
     printf "$(bold_text "$(cyan "Searching Merklemap certificate database...")")\n"
     printf "$(yellow "Query"): %s\n" "$query"
+    printf "$(yellow "Type"): %s\n" "${argc_type:-wildcard}"
     printf "$(yellow "Page"): %s\n" "$page"
     printf "\n"
   fi
@@ -529,6 +584,13 @@ do_search() {
 if [ "${argc_help:-0}" = "1" ]; then
   show_help
   exit 0
+fi
+
+if [ -z "${argc_query:-}" ]; then
+  printf "$(red "Error"): Search query is required\n" >&2
+  printf "\n"
+  show_help
+  exit 1
 fi
 
 do_search
