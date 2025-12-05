@@ -6,11 +6,13 @@
 # @option -p --page "Page number for pagination" [int] @default "0"
 # @option -t --type "Search type (wildcard or distance)" [string] @default "wildcard"
 
-# @flag -j --json "Output raw JSON response"
+# @flag -j --json "Output raw JSON response (streamed as NDJSON)"
 # @flag -q --quiet "Suppress colored output and progress indicators"
 # @flag --no-header "Don't display header information"
 # @flag --csv "Output results in CSV format"
 # @flag --sort-date "Sort results by first_seen date (newest first)"
+# @flag -a --auto "Auto-paginate to fetch all results"
+# @option -l --limit "Maximum number of results to return" [int]
 # @meta require-tools curl,jq
 
 eval "$(argc --argc-eval "$0" "$@")"
@@ -145,12 +147,16 @@ show_help() {
   echo "  $(green "$(basename "$0") \"api.*.example.com\"")"
   echo "  $(green "$(basename "$0") revelo --type distance")"
   echo "  $(green "$(basename "$0") \"*.github.com\" --page 2")"
+  echo "  $(green "$(basename "$0") \"*.example.com\" --auto")           # Fetch all pages"
+  echo "  $(green "$(basename "$0") \"*.example.com\" --limit 50")       # Get first 50 results"
+  echo "  $(green "$(basename "$0") \"*.example.com\" -aj")              # Stream all as NDJSON"
   echo ""
   echo "$(bold_text "Options"):"
   echo "  $(yellow "-t, --type")        Search type: wildcard (default) or distance"
   echo "  $(yellow "-p, --page")        Page number for pagination (default: 0)"
-
-  echo "  $(yellow "-j, --json")        Output raw JSON response"
+  echo "  $(yellow "-a, --auto")        Auto-paginate to fetch all results"
+  echo "  $(yellow "-l, --limit")       Maximum number of results to return"
+  echo "  $(yellow "-j, --json")        Output as NDJSON (newline-delimited JSON)"
   echo "  $(yellow "-q, --quiet")       Suppress colored output"
   echo "  $(yellow "--no-header")       Don't display header information"
   echo "  $(yellow "--csv")             Output results in CSV format"
@@ -257,21 +263,141 @@ generate_csv() {
 do_search() {
   local query="${argc_query:-}"
   local page="${argc_page:-0}"
-
+  local limit="${argc_limit:-}"
+  local auto="${argc_auto:-0}"
 
   if [ "${argc_quiet:-0}" != "1" ]; then
     printf "$(bold_text "$(cyan "Searching Merklemap certificate database...")")\n"
     printf "$(yellow "Query"): %s\n" "$query"
     printf "$(yellow "Type"): %s\n" "${argc_type:-wildcard}"
-    printf "$(yellow "Page"): %s\n" "$page"
+    if [ "$auto" = "1" ]; then
+      printf "$(yellow "Mode"): Auto-paginate all results\n"
+    else
+      printf "$(yellow "Page"): %s\n" "$page"
+    fi
+    if [ -n "$limit" ]; then
+      printf "$(yellow "Limit"): %s\n" "$limit"
+    fi
     printf "\n"
   fi
 
+  # Auto-pagination mode with NDJSON streaming for JSON output
+  if [ "$auto" = "1" ]; then
+    local current_page=0
+    local total_fetched=0
+    local total_count=0
+    local all_results=""
+
+    while true; do
+      local response=$(make_request "$query" "$current_page")
+      
+      # Get total count from first response
+      if [ "$current_page" -eq 0 ]; then
+        total_count=$(echo "$response" | jq -r '.count // 0')
+        if [ "$total_count" -eq 0 ]; then
+          if [ "${argc_json:-0}" = "1" ]; then
+            exit 0
+          fi
+          printf "$(yellow "No certificates found for query: ${query}")\n"
+          return 0
+        fi
+      fi
+
+      local results_in_page=$(echo "$response" | jq '.results | length')
+      
+      if [ "$results_in_page" -eq 0 ]; then
+        break
+      fi
+
+      # Stream NDJSON output immediately
+      if [ "${argc_json:-0}" = "1" ]; then
+        if [ -n "$limit" ]; then
+          local remaining=$((limit - total_fetched))
+          echo "$response" | jq -c ".results[:$remaining][]"
+          total_fetched=$((total_fetched + remaining))
+          if [ "$total_fetched" -ge "$limit" ]; then
+            break
+          fi
+        else
+          echo "$response" | jq -c '.results[]'
+          total_fetched=$((total_fetched + results_in_page))
+        fi
+      elif [ "${argc_csv:-0}" = "1" ]; then
+        # For CSV, accumulate results
+        if [ -z "$all_results" ]; then
+          all_results="$response"
+        else
+          # Merge results arrays
+          all_results=$(echo "$all_results" "$response" | jq -s '.[0] * {results: ([.[].results] | add)}')
+        fi
+        total_fetched=$((total_fetched + results_in_page))
+        if [ -n "$limit" ] && [ "$total_fetched" -ge "$limit" ]; then
+          break
+        fi
+      else
+        # For formatted output, accumulate results
+        if [ -z "$all_results" ]; then
+          all_results="$response"
+        else
+          all_results=$(echo "$all_results" "$response" | jq -s '.[0] * {results: ([.[].results] | add)}')
+        fi
+        total_fetched=$((total_fetched + results_in_page))
+        if [ -n "$limit" ] && [ "$total_fetched" -ge "$limit" ]; then
+          break
+        fi
+      fi
+
+      # Check if we've fetched all results
+      if [ "$total_fetched" -ge "$total_count" ]; then
+        break
+      fi
+
+      current_page=$((current_page + 1))
+      
+      # Progress indicator for non-quiet mode
+      if [ "${argc_quiet:-0}" != "1" ] && [ "${argc_json:-0}" != "1" ]; then
+        printf "\r$(cyan "Fetched %d/%d results...")" "$total_fetched" "$total_count" >&2
+      fi
+    done
+
+    # Clear progress line
+    if [ "${argc_quiet:-0}" != "1" ] && [ "${argc_json:-0}" != "1" ]; then
+      printf "\r\033[K" >&2
+    fi
+
+    if [ "${argc_json:-0}" = "1" ]; then
+      exit 0
+    fi
+
+    # Apply limit to accumulated results
+    if [ -n "$limit" ]; then
+      all_results=$(echo "$all_results" | jq ".results = .results[:$limit]")
+    fi
+
+    if [ "${argc_csv:-0}" = "1" ]; then
+      generate_csv "$all_results"
+      exit 0
+    fi
+
+    format_search_results "$all_results"
+    return 0
+  fi
+
+  # Single page mode
   local response=$(make_request "$query" "$page")
 
   if [ "${argc_json:-0}" = "1" ]; then
-    echo "$response" | jq
+    if [ -n "$limit" ]; then
+      echo "$response" | jq -c ".results[:$limit][]"
+    else
+      echo "$response" | jq -c '.results[]'
+    fi
     exit 0
+  fi
+
+  # Apply limit to results
+  if [ -n "$limit" ]; then
+    response=$(echo "$response" | jq ".results = .results[:$limit]")
   fi
 
   if [ "${argc_csv:-0}" = "1" ]; then
